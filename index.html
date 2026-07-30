@@ -7889,35 +7889,78 @@ window.addEventListener('message', (e) => {
             if (!syncSettings.token || !syncSettings.repo) { alert("Please enter your GitHub Token and Repo (username/repo) first."); return; }
             document.getElementById('sync-status').innerText = "Status: Pulling...";
             try {
-                // Pull Timeline
-                const res = await ghApiCall('GET', 'timeline_data.txt');
-                if (!res.ok) throw new Error('Timeline not found in Repo');
-                const fileData = await res.json();
-                
-                // FIX: Use LZString's native Base64 decompressor. Github adds newlines to Base64, so we remove them first.
-                const cleanBase64 = fileData.content.replace(/\n/g, '');
-                const decompressedJSON = LZString.decompressFromBase64(cleanBase64);
-                const cloudData = JSON.parse(decompressedJSON);
-                
-                Object.assign(state, cloudData);
-                normalizeLoadedState();
-                
-                await db.timeline.put({ id: 'main', data: JSON.stringify(state) });
+                // Helper to gracefully handle the Safe Base64 format
+                const safeDecompress = (str) => {
+                    if (!str) return null;
+                    const cleanStr = str.replace(/\n/g, '');
+                    let decompressed = null;
+                    try {
+                        const decodedText = atob(cleanStr);
+                        if (/^[A-Za-z0-9+/=]+$/.test(decodedText)) {
+                            decompressed = LZString.decompressFromBase64(decodedText);
+                        }
+                    } catch(e) {}
+                    if (!decompressed) {
+                        decompressed = LZString.decompressFromBase64(cleanStr);
+                    }
+                    return decompressed;
+                };
 
-                // Pull Diagrams
+                // Pull Timeline (With 1MB+ Bypass)
+                const res = await ghApiCall('GET', 'timeline_data.txt');
+                if (res.ok) {
+                    const fileData = await res.json();
+                    let rawContent = null;
+                    
+                    if (fileData.content) {
+                        rawContent = safeDecompress(fileData.content);
+                    } else if (fileData.download_url) {
+                        const urlObj = new URL(fileData.download_url);
+                        urlObj.searchParams.append('t', Date.now());
+                        const rawRes = await fetch(urlObj.toString());
+                        if (rawRes.ok) {
+                            const rawText = await rawRes.text();
+                            rawContent = LZString.decompressFromBase64(rawText.replace(/\n/g, '')) || safeDecompress(rawText);
+                        }
+                    }
+
+                    if (rawContent) {
+                        const cloudData = JSON.parse(rawContent);
+                        Object.assign(state, cloudData);
+                        normalizeLoadedState();
+                        await db.timeline.put({ id: 'main', data: JSON.stringify(state) });
+                    }
+                }
+
+                // Pull Diagrams (With 1MB+ Bypass via download_url)
                 const diagListRes = await ghApiCall('GET', 'diagrams');
                 if (diagListRes.ok) {
                     const diagFiles = await diagListRes.json();
                     for (let file of diagFiles) {
-                        if (file.name.endsWith('.txt')) {
-                            const dRes = await ghApiCall('GET', `diagrams/${file.name}`);
-                            if (dRes.ok) {
-                                const dData = await dRes.json();
-                                const dCleanBase64 = dData.content.replace(/\n/g, '');
-                                const dDecompressedJSON = LZString.decompressFromBase64(dCleanBase64);
+                        if (file.name.endsWith('.txt') && file.download_url) {
+                            try {
+                                // Fetch raw file directly from GitHub CDN to bypass 1MB API limit
+                                const urlObj = new URL(file.download_url);
+                                urlObj.searchParams.append('t', Date.now());
+                                
+                                const dRes = await fetch(urlObj.toString());
+                                if (!dRes.ok) continue;
+                                
+                                const rawText = await dRes.text();
+                                if (!rawText) continue;
+                                
+                                // Direct download_url gives us the exact string we saved
+                                let dDecompressedJSON = LZString.decompressFromBase64(rawText.replace(/\n/g, ''));
+                                
+                                // Fallback just in case
+                                if (!dDecompressedJSON) dDecompressedJSON = safeDecompress(rawText);
+                                if (!dDecompressedJSON) throw new Error("Decompression failed");
+                                
                                 const dObj = JSON.parse(dDecompressedJSON);
                                 diagramStore[dObj.id] = dObj;
                                 await db.diagrams.put({ id: dObj.id, data: JSON.stringify(dObj) });
+                            } catch (e) {
+                                console.warn(`Skipping diagram ${file.name}:`, e);
                             }
                         }
                     }
@@ -7925,6 +7968,7 @@ window.addEventListener('message', (e) => {
                 
                 document.getElementById('sync-status').innerText = "Status: Synced (Cloud)";
                 renderAll();
+                alert("Cloud Pull Complete! Large diagrams successfully downloaded.");
             } catch (err) {
                 console.error(err);
                 document.getElementById('sync-status').innerText = "Status: Pull Failed!";
@@ -7937,7 +7981,6 @@ window.addEventListener('message', (e) => {
             isSyncing = true;
 
             while(ghQueue.length > 0) {
-                // UPDATE UI: Show exactly how many files are currently uploading
                 document.getElementById('sync-status').innerText = `Status: Syncing to Cloud (${ghQueue.length} left)...`;
                 
                 const task = ghQueue.shift();
@@ -7954,22 +7997,24 @@ window.addEventListener('message', (e) => {
                             await ghApiCall('DELETE', task.path, { message: `Delete ${task.path}`, sha: sha });
                         }
                     } else if (task.action === 'upsert') {
-                        const b64Content = LZString.compressToBase64(task.content);
+                        // FIX: Double-Base64 encode. GitHub decodes the outer Base64 and saves the inner as pure text.
+                        // This entirely prevents Git from applying line-ending normalization and corrupting your data!
+                        const safeBase64 = btoa(LZString.compressToBase64(task.content));
+                        
                         const body = {
                             message: `Update ${task.path}`,
-                            content: b64Content
+                            content: safeBase64
                         };
                         if (sha) body.sha = sha;
 
                         const putRes = await ghApiCall('PUT', task.path, body);
                         
-                        // UPGRADED FIX: Catch ALL GitHub rejections (409, 422, 403) and retry up to 3 times.
                         if (!putRes.ok) {
                             task.retries = (task.retries || 0) + 1;
                             if (task.retries <= 3) {
                                 console.warn(`GitHub API busy for ${task.path}. Retrying (${task.retries}/3)...`);
-                                ghQueue.unshift(task); // Put it back at the front of the line
-                                await new Promise(r => setTimeout(r, 2000)); // Wait 2 seconds for GitHub to catch up
+                                ghQueue.unshift(task);
+                                await new Promise(r => setTimeout(r, 2000));
                                 continue;
                             } else {
                                 console.error(`Failed to sync ${task.path} after 3 attempts.`);
@@ -7977,7 +8022,6 @@ window.addEventListener('message', (e) => {
                         }
                     }
                     
-                    // Mandatory 1-second delay between GitHub API writes
                     await new Promise(r => setTimeout(r, 1000));
                     
                 } catch (err) {

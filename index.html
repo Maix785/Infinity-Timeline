@@ -6591,6 +6591,9 @@
     </script>
 
     <style>
+	
+	@keyframes spin { 100% { transform: rotate(360deg); } }
+	
         :root {
             --bg-color: #0f1115; --ruler-bg: #15181e; --grid-color: #2a2d35;
             --text-primary: #f0f0f0; --text-secondary: #8b909c; --now-line: #ef4444;
@@ -6804,6 +6807,10 @@
         <canvas id="timeline-canvas"></canvas>
         <div id="events-container"></div>
         <div id="now-line"></div>
+		<!-- Global Sync Indicator -->
+        <div id="global-sync-indicator" style="position:fixed; top:20px; right:30px; background:var(--modal-bg); color:var(--text-primary); border:1px solid var(--accent-color); padding:6px 12px; border-radius:20px; font-size:12px; font-weight:600; z-index:1000; display:none; box-shadow:0 4px 12px rgba(0,0,0,0.5); pointer-events:none;">
+            <span style="display:inline-block; animation:spin 1s linear infinite; margin-right:4px;">🔄</span> <span id="global-sync-text">Syncing...</span>
+        </div>
         
         <div id="ui-layer-left">
             <div id="left-menu-list" style="display:flex; flex-direction:column; gap:8px;">
@@ -7447,6 +7454,15 @@
         let editingPaletteIdx = -1;
 
         let syncSettings = JSON.parse(localStorage.getItem(SYNC_KEY)) || { token: '', repo: '' };
+		
+		function setGlobalSyncState(isSyncing, text = "Syncing...") {
+            const ind = document.getElementById('global-sync-indicator');
+            const txt = document.getElementById('global-sync-text');
+            if (ind && txt) {
+                ind.style.display = isSyncing ? 'block' : 'none';
+                txt.innerText = text;
+            }
+        }
         
         // Initialize the empty diagram store in memory
         let diagramStore = {};
@@ -7885,100 +7901,150 @@ window.addEventListener('message', (e) => {
             return fetch(url, opts);
         }
 
-        async function forceLoadFromCloud() {
-            if (!syncSettings.token || !syncSettings.repo) { alert("Please enter your GitHub Token and Repo (username/repo) first."); return; }
-            document.getElementById('sync-status').innerText = "Status: Pulling...";
+        async function forceLoadFromCloud(isAutoBoot = false) {
+    if (!syncSettings.token || !syncSettings.repo) { 
+        if (!isAutoBoot) alert("Please enter your GitHub Token and Repo first."); 
+        return; 
+    }
+    
+    document.getElementById('sync-status').innerText = isAutoBoot ? "Status: Checking Cloud..." : "Status: Smart Pulling...";
+    try {
+        const safeDecompress = (str) => {
+            if (!str) return null;
+            const cleanStr = str.replace(/\n/g, '');
+            let decompressed = null;
             try {
-                // Helper to gracefully handle the Safe Base64 format
-                const safeDecompress = (str) => {
-                    if (!str) return null;
-                    const cleanStr = str.replace(/\n/g, '');
-                    let decompressed = null;
-                    try {
-                        const decodedText = atob(cleanStr);
-                        if (/^[A-Za-z0-9+/=]+$/.test(decodedText)) {
-                            decompressed = LZString.decompressFromBase64(decodedText);
-                        }
-                    } catch(e) {}
-                    if (!decompressed) {
-                        decompressed = LZString.decompressFromBase64(cleanStr);
-                    }
-                    return decompressed;
-                };
+                const decodedText = atob(cleanStr);
+                if (/^[A-Za-z0-9+/=]+$/.test(decodedText)) decompressed = LZString.decompressFromBase64(decodedText);
+            } catch(e) {}
+            return decompressed || LZString.decompressFromBase64(cleanStr);
+        };
 
-                // Pull Timeline (With 1MB+ Bypass)
-                const res = await ghApiCall('GET', 'timeline_data.txt');
-                if (res.ok) {
-                    const fileData = await res.json();
-                    let rawContent = null;
-                    
-                    if (fileData.content) {
-                        rawContent = safeDecompress(fileData.content);
-                    } else if (fileData.download_url) {
-                        const urlObj = new URL(fileData.download_url);
-                        urlObj.searchParams.append('t', Date.now());
-                        const rawRes = await fetch(urlObj.toString());
-                        if (rawRes.ok) {
-                            const rawText = await rawRes.text();
-                            rawContent = LZString.decompressFromBase64(rawText.replace(/\n/g, '')) || safeDecompress(rawText);
-                        }
-                    }
+        // 1. Fetch Timeline Metadata
+        const res = await ghApiCall('GET', 'timeline_data.txt');
+        if (!res.ok) {
+            if(!isAutoBoot) throw new Error('Timeline not found in Repo');
+            return;
+        }
+        const fileData = await res.json();
+        
+        let rawContent = null;
+        if (fileData.content) {
+            rawContent = safeDecompress(fileData.content);
+        } else if (fileData.download_url) {
+            const urlObj = new URL(fileData.download_url);
+            urlObj.searchParams.append('t', Date.now());
+            const rawRes = await fetch(urlObj.toString());
+            if (rawRes.ok) rawContent = LZString.decompressFromBase64((await rawRes.text()).replace(/\n/g, '')) || safeDecompress(await rawRes.text());
+        }
 
-                    if (rawContent) {
-                        const cloudData = JSON.parse(rawContent);
-                        Object.assign(state, cloudData);
-                        normalizeLoadedState();
-                        await db.timeline.put({ id: 'main', data: JSON.stringify(state) });
-                    }
+        if (!rawContent) throw new Error("Timeline data corrupted.");
+        const cloudData = JSON.parse(rawContent);
+
+        // --- 2. CONFLICT RESOLUTION GUARDIAN ---
+        const localSyncAnchor = state.lastSyncTime || 0;
+        const hasLocalUnsyncedChanges = state.lastModified > localSyncAnchor;
+        const isCloudNewer = cloudData.lastModified && cloudData.lastModified > localSyncAnchor;
+
+        if (hasLocalUnsyncedChanges && isCloudNewer) {
+            const overwrite = confirm(
+                "⚠️ SYNC CONFLICT DETECTED ⚠️\n\n" +
+                "Another device updated the cloud, but you ALSO have unsynced edits on this device.\n\n" +
+                "Click 'OK' to DELETE your local edits and download the cloud data.\n" +
+                "Click 'Cancel' to keep your local edits (you can manually Push later)."
+            );
+            if (!overwrite) {
+                document.getElementById('sync-status').innerText = "Status: Sync Paused (Conflict)";
+                setGlobalSyncState(false);
+                if (!isAutoBoot) alert("Pull cancelled. Your local edits are safe.");
+                return; // Stop the pull completely
+            }
+        }
+
+        // --- 3. TIMELINE DELTA SYNC ---
+        if (cloudData.lastModified && (!state.lastModified || cloudData.lastModified > state.lastModified || isCloudNewer)) {
+            Object.assign(state, cloudData);
+            state.lastSyncTime = Date.now(); // Update the anchor!
+            if (typeof normalizeLoadedState === 'function') normalizeLoadedState();
+            await db.timeline.put({ id: 'main', data: JSON.stringify(state) });
+            if (typeof renderAll === 'function') renderAll();
+        }
+
+        // --- 4. DIAGRAM DELTA SYNC ---
+        if (cloudData.diagramMeta) {
+            const diagsToFetch = [];
+            
+            // A. Check for NEW or UPDATED diagrams from the cloud
+            for (const diagId in cloudData.diagramMeta) {
+                const cloudTime = cloudData.diagramMeta[diagId];
+                const localTime = diagramStore[diagId] ? (diagramStore[diagId].updated || diagramStore[diagId].created || 0) : 0;
+                if (cloudTime > localTime) diagsToFetch.push(diagId);
+            }
+
+            // B. Check for ZOMBIE diagrams (deleted in cloud, still exist locally)
+            const localDiagIds = Object.keys(diagramStore);
+            for (const localId of localDiagIds) {
+                if (!cloudData.diagramMeta[localId]) {
+                    delete diagramStore[localId];
+                    await db.diagrams.delete(localId);
                 }
+            }
 
-                // Pull Diagrams (With 1MB+ Bypass via download_url)
+            // C. Download the needed updates
+            if (diagsToFetch.length > 0) {
+                document.getElementById('sync-status').innerText = `Status: Fetching ${diagsToFetch.length} updated diagram(s)...`;
+                
                 const diagListRes = await ghApiCall('GET', 'diagrams');
                 if (diagListRes.ok) {
                     const diagFiles = await diagListRes.json();
-                    for (let file of diagFiles) {
-                        if (file.name.endsWith('.txt') && file.download_url) {
+                    for (let diagId of diagsToFetch) {
+                        const file = diagFiles.find(f => f.name === `${diagId}.txt`);
+                        if (file && file.download_url) {
                             try {
-                                // Fetch raw file directly from GitHub CDN to bypass 1MB API limit
                                 const urlObj = new URL(file.download_url);
                                 urlObj.searchParams.append('t', Date.now());
-                                
                                 const dRes = await fetch(urlObj.toString());
                                 if (!dRes.ok) continue;
-                                
                                 const rawText = await dRes.text();
                                 if (!rawText) continue;
                                 
-                                // Direct download_url gives us the exact string we saved
-                                let dDecompressedJSON = LZString.decompressFromBase64(rawText.replace(/\n/g, ''));
-                                
-                                // Fallback just in case
-                                if (!dDecompressedJSON) dDecompressedJSON = safeDecompress(rawText);
-                                if (!dDecompressedJSON) throw new Error("Decompression failed");
+                                const dDecompressedJSON = LZString.decompressFromBase64(rawText.replace(/\n/g, '')) || safeDecompress(rawText);
+                                if (!dDecompressedJSON) continue;
                                 
                                 const dObj = JSON.parse(dDecompressedJSON);
                                 diagramStore[dObj.id] = dObj;
                                 await db.diagrams.put({ id: dObj.id, data: JSON.stringify(dObj) });
-                            } catch (e) {
-                                console.warn(`Skipping diagram ${file.name}:`, e);
-                            }
+                            } catch (e) { console.warn(`Skipping diagram ${file.name}:`, e); }
                         }
                     }
+                    if (typeof renderProjects === 'function') renderProjects();
+                    if (document.getElementById('popout_diagrams_manager')) openDiagramsManager();
                 }
-                
-                document.getElementById('sync-status').innerText = "Status: Synced (Cloud)";
-                renderAll();
-                alert("Cloud Pull Complete! Large diagrams successfully downloaded.");
-            } catch (err) {
-                console.error(err);
-                document.getElementById('sync-status').innerText = "Status: Pull Failed!";
-                alert("Failed to pull from GitHub. Check the console (F12) for details.");
             }
+        } else {
+            // D. If the cloud has ZERO diagrams, wipe local to match
+            for (const localId of Object.keys(diagramStore)) {
+                delete diagramStore[localId];
+                await db.diagrams.delete(localId);
+            }
+            if (typeof renderProjects === 'function') renderProjects();
+            if (document.getElementById('popout_diagrams_manager')) openDiagramsManager();
         }
+        
+        document.getElementById('sync-status').innerText = "Status: Synced (Cloud)";
+        if (!isAutoBoot) alert("Smart Pull Complete! Timeline and Diagrams are up to date.");
+    } catch (err) {
+        console.error(err);
+        document.getElementById('sync-status').innerText = "Status: Pull Failed!";
+        setGlobalSyncState(false);
+        if (!isAutoBoot) alert("Failed to pull from GitHub. Check the console (F12) for details.");
+    }
+}
 
         async function processSyncQueue() {
             if (isSyncing || ghQueue.length === 0 || !syncSettings.token || !syncSettings.repo) return;
             isSyncing = true;
+			setGlobalSyncState(true, "Pushing...");
 
             while(ghQueue.length > 0) {
                 document.getElementById('sync-status').innerText = `Status: Syncing to Cloud (${ghQueue.length} left)...`;
@@ -7997,39 +8063,28 @@ window.addEventListener('message', (e) => {
                             await ghApiCall('DELETE', task.path, { message: `Delete ${task.path}`, sha: sha });
                         }
                     } else if (task.action === 'upsert') {
-                        // FIX: Double-Base64 encode. GitHub decodes the outer Base64 and saves the inner as pure text.
-                        // This entirely prevents Git from applying line-ending normalization and corrupting your data!
                         const safeBase64 = btoa(LZString.compressToBase64(task.content));
-                        
                         const body = {
                             message: `Update ${task.path}`,
                             content: safeBase64
                         };
                         if (sha) body.sha = sha;
-
-                        const putRes = await ghApiCall('PUT', task.path, body);
                         
-                        if (!putRes.ok) {
-                            task.retries = (task.retries || 0) + 1;
-                            if (task.retries <= 3) {
-                                console.warn(`GitHub API busy for ${task.path}. Retrying (${task.retries}/3)...`);
-                                ghQueue.unshift(task);
-                                await new Promise(r => setTimeout(r, 2000));
-                                continue;
-                            } else {
-                                console.error(`Failed to sync ${task.path} after 3 attempts.`);
-                            }
-                        }
+                        await ghApiCall('PUT', task.path, body);
                     }
-                    
-                    await new Promise(r => setTimeout(r, 1000));
-                    
                 } catch (err) {
-                    console.error(`Failed to sync ${task.path}`, err);
+                    console.error("Sync error:", err);
                 }
             }
+            
             isSyncing = false;
             document.getElementById('sync-status').innerText = "Status: Synced (Cloud)";
+			setGlobalSyncState(false);
+            
+            // --- SET SYNC ANCHOR ---
+            // After a successful push, update the anchor to confirm local and cloud are identical.
+            state.lastSyncTime = Date.now();
+            await db.timeline.put({ id: 'main', data: JSON.stringify(state) });
         }
 
         // NEW: A manual push function to force the initial upload of everything
@@ -8066,17 +8121,26 @@ window.addEventListener('message', (e) => {
         }
 
         async function saveToStorage() { 
+            state.lastModified = Date.now(); // Track local edits (Does NOT update lastSyncTime)
             const stateStr = JSON.stringify(state);
             await db.timeline.put({ id: 'main', data: stateStr });
-            triggerCloudSync('timeline_data.txt', stateStr, 'upsert');
+            
+            ghQueue.push({ action: 'upsert', path: 'timeline_data.txt', content: stateStr });
+            processSyncQueue();
         }
 
         async function saveDiagramStore(specificDiagId = null) {
-            // Save specific diagram to IndexedDB and Queue for Cloud Sync
             if (specificDiagId && diagramStore[specificDiagId]) {
                 const diagStr = JSON.stringify(diagramStore[specificDiagId]);
                 await db.diagrams.put({ id: specificDiagId, data: diagStr });
-                triggerCloudSync(`diagrams/${specificDiagId}.txt`, diagStr, 'upsert');
+                
+                ghQueue.push({ action: 'upsert', path: `diagrams/${specificDiagId}.txt`, content: diagStr });
+                processSyncQueue();
+                
+                // Track diagram timestamps in timeline state for Delta Sync
+                if (!state.diagramMeta) state.diagramMeta = {};
+                state.diagramMeta[specificDiagId] = diagramStore[specificDiagId].updated || diagramStore[specificDiagId].created || Date.now();
+                saveToStorage();
             }
         }
         
@@ -8084,7 +8148,15 @@ window.addEventListener('message', (e) => {
             if (diagramStore[diagId]) {
                 delete diagramStore[diagId];
                 await db.diagrams.delete(diagId);
-                triggerCloudSync(`diagrams/${diagId}.txt`, null, 'delete');
+                
+                ghQueue.push({ action: 'delete', path: `diagrams/${diagId}.txt`, content: null });
+                processSyncQueue();
+                
+                // Remove from Delta Sync metadata
+                if (state.diagramMeta && state.diagramMeta[diagId]) {
+                    delete state.diagramMeta[diagId];
+                    saveToStorage();
+                }
             }
         }
 
@@ -8159,8 +8231,9 @@ window.addEventListener('message', (e) => {
             checkNotifications();
             applyAtmosphere();
 
-            // REMOVED: The forceLoadFromCloud() call that was causing the Ghost Reverts.
-            // The local IndexedDB is now the master truth. Only pull manually via the UI button.
+            // Perform a safe smart-pull on boot to check for external updates.
+			// The conflict resolution guardian will protect unsynced local changes.
+			forceLoadFromCloud(true);
         }
 
         function renderAll() {

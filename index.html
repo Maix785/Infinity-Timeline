@@ -8181,7 +8181,13 @@ window.addEventListener('message', (e) => {
             if(!state.customTodos) state.customTodos = []; if(!state.todoTabs) state.todoTabs = ['Inbox', 'Done']; if(!state.activeTodoTab) state.activeTodoTab = 'Inbox';
             if(!state.habitTabs) state.habitTabs = ['Main']; if(!state.activeHabitTab) state.activeHabitTab = 'Main'; if(!state.trackedHabits) state.trackedHabits = []; if(!state.habitCompletions) state.habitCompletions = {};
             if(!state.notes) state.notes = [{id: 'n1', title: 'Main Note', content: ''}]; if(!state.notifications) state.notifications = []; if(!state.customReminders) state.customReminders = [];
-            if(!state.expandedTodoNotes) state.expandedTodoNotes = {};
+            
+            // FORCE ALL UI TRAYS AND NOTES TO BE COLLAPSED BY DEFAULT ON LOAD
+            state.expandedTodoNotes = {};
+            state.expandedListNotes = {};
+            state.expandedProjectNotes = {};
+            state.expandedInline = {};
+
             if(!state.showTabs) state.showTabs = { todo: true, habits: true, notes: true, music: true, projects: true };
             if(!state.layouts) state.layouts = {};
             if(!state.savedThemes) state.savedThemes = {};
@@ -8196,7 +8202,6 @@ window.addEventListener('message', (e) => {
             if(!state.activeListTab) state.activeListTab = state.listTabs[0];
             if(!state.listItems) state.listItems = [];
             if(!state.activeTodoView) state.activeTodoView = 'todo';
-            if(!state.expandedListNotes) state.expandedListNotes = {};
 
             if(!state.musicEmbedTabs) state.musicEmbedTabs = ['Favorites']; if(!state.activeMusicEmbedTab) state.activeMusicEmbedTab = 'Favorites'; if(!state.musicEmbeds) state.musicEmbeds = [];
             if(!state.radioTabs) state.radioTabs = ['Stations']; if(!state.activeRadioTab) state.activeRadioTab = 'Stations'; if(!state.radios) state.radios = [];
@@ -8208,7 +8213,6 @@ window.addEventListener('message', (e) => {
             if(!state.activeProjectCategory) state.activeProjectCategory = {};
             if(!state.activeProjectCategory[state.activeProjectTab]) state.activeProjectCategory[state.activeProjectTab] = 'General';
             if(!state.projectItems) state.projectItems = [];
-            if(!state.expandedProjectNotes) state.expandedProjectNotes = {};
 
             state.events.forEach(e => { if (!e.type) e.type = e.isMilestone ? 'milestone' : 'event'; if (e.zIndex === undefined) e.zIndex = 0; if (e.inTodoList && !e.todoTab) e.todoTab = 'Inbox'; });
             state.customTodos.forEach(c => { if(!c.tab) c.tab = 'Inbox'; if(!c.type) c.type = 'todo'; });
@@ -10029,7 +10033,6 @@ window.openDrawioWorkspace = (existingDiagId = null, title = "New Diagram", mode
         window.toggleInlineTray = (id) => {
             if (!state.expandedInline) state.expandedInline = {};
             state.expandedInline[id] = !state.expandedInline[id];
-            saveToStorage();
             renderTodos();
             renderProjects();
         };

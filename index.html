@@ -7914,7 +7914,7 @@ window.addEventListener('message', (e) => {
 
         async function forceLoadFromCloud(isAutoBoot = false) {
             if (!syncSettings.token || !syncSettings.repo) { 
-                if (!isAutoBoot) alert("Please enter your GitHub Token and Repo first."); 
+                if (!isAutoBoot) console.warn("Please enter your GitHub Token and Repo first."); 
                 return; 
             }
             
@@ -7923,7 +7923,7 @@ window.addEventListener('message', (e) => {
                 // 1. Fetch Timeline Metadata (Lightweight)
                 const res = await ghApiCall('GET', 'timeline_data.txt');
                 if (!res.ok) {
-                    if(!isAutoBoot) throw new Error('Timeline not found in Repo');
+                    if(!isAutoBoot) console.warn('Timeline not found in Repo');
                     return;
                 }
                 const fileData = await res.json();
@@ -7931,7 +7931,7 @@ window.addEventListener('message', (e) => {
                 
                 // --- 2. SHA CONFLICT RESOLUTION GUARDIAN ---
                 const hasLocalUnsyncedChanges = state.lastModified > (state.lastSyncTime || 0);
-                const isCloudNewer = syncSettings.timelineSha && cloudSha !== syncSettings.timelineSha;
+                const isCloudNewer = syncSettings.timelineSha && cloudSha !== syncSettings.timelineSha && cloudSha !== syncSettings.previousTimelineSha;
 
                 if (hasLocalUnsyncedChanges && isCloudNewer) {
                     const overwrite = confirm(
@@ -7943,7 +7943,6 @@ window.addEventListener('message', (e) => {
                     if (!overwrite) {
                         document.getElementById('sync-status').innerText = "Status: Sync Paused (Conflict)";
                         if (typeof setGlobalSyncState === 'function') setGlobalSyncState(false);
-                        if (!isAutoBoot) alert("Pull cancelled. Your local edits are safe.");
                         return; // Stop the pull
                     }
                 }
@@ -7966,6 +7965,7 @@ window.addEventListener('message', (e) => {
                 if (!state.lastModified || isCloudNewer || !syncSettings.timelineSha) {
                     Object.assign(state, cloudData);
                     
+                    syncSettings.previousTimelineSha = syncSettings.timelineSha;
                     syncSettings.timelineSha = cloudSha; // Save the new SHA
                     localStorage.setItem(SYNC_KEY, JSON.stringify(syncSettings));
                     
@@ -8027,7 +8027,6 @@ window.addEventListener('message', (e) => {
                 }
                 
                 document.getElementById('sync-status').innerText = "Status: Synced (Cloud)";
-                if (!isAutoBoot) alert("Smart Pull Complete! Timeline and Diagrams are up to date.");
             } catch (err) {
                 console.error(err);
                 document.getElementById('sync-status').innerText = "Status: Pull Failed!";
@@ -8053,15 +8052,20 @@ window.addEventListener('message', (e) => {
                         sha = existingFile.sha;
                         
                         // --- PRE-PUSH SHA GUARDIAN ---
-                        // If we are pushing the timeline, check if the cloud's SHA matches our last known SHA.
                         if (task.path === 'timeline_data.txt' && task.action === 'upsert') {
                             if (syncSettings.timelineSha && sha !== syncSettings.timelineSha) {
-                                console.warn("Pre-push aborted: Cloud SHA mismatch! Another device modified this file.");
-                                isSyncing = false;
-                                ghQueue = []; // Clear queue to prevent blind overwrites
-                                setGlobalSyncState(false);
-                                forceLoadFromCloud(false); // Trigger the conflict modal
-                                return; 
+                                // TOLERATE GITHUB CACHE LAG: If GitHub hands us the SHA we just overwrote, ignore the lag!
+                                if (syncSettings.previousTimelineSha && sha === syncSettings.previousTimelineSha) {
+                                    console.warn("Stale GitHub cache detected. Using known latest SHA.");
+                                    sha = syncSettings.timelineSha; // Override with the real latest SHA
+                                } else {
+                                    console.warn("Pre-push aborted: Cloud SHA mismatch! Another device modified this file.");
+                                    isSyncing = false;
+                                    ghQueue = []; // Clear queue to prevent blind overwrites
+                                    setGlobalSyncState(false);
+                                    forceLoadFromCloud(true); // Suppress alerts, handle conflict silently
+                                    return; 
+                                }
                             }
                         }
                     }
@@ -8073,14 +8077,14 @@ window.addEventListener('message', (e) => {
                     } else if (task.action === 'upsert') {
                         const safeBase64 = btoa(LZString.compressToBase64(task.content));
                         const body = { message: `Update ${task.path}`, content: safeBase64 };
-                        if (sha) body.sha = sha;
+                        if (sha) body.sha = sha; // Pass the verified SHA back to GitHub
                         
                         const putRes = await ghApiCall('PUT', task.path, body);
                         
                         // --- SAVE NEW SHA LOCALLY ---
-                        // Record the new permission slip so our NEXT push knows we own the latest version
                         if (putRes.ok && task.path === 'timeline_data.txt') {
                             const putData = await putRes.json();
+                            syncSettings.previousTimelineSha = syncSettings.timelineSha; // Remember the one we just replaced
                             syncSettings.timelineSha = putData.content.sha;
                             localStorage.setItem(SYNC_KEY, JSON.stringify(syncSettings));
                         }

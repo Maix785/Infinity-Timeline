@@ -8213,12 +8213,18 @@ window.addEventListener('message', (e) => {
             if(!state.activeProjectCategory) state.activeProjectCategory = {};
             if(!state.activeProjectCategory[state.activeProjectTab]) state.activeProjectCategory[state.activeProjectTab] = 'General';
             if(!state.projectItems) state.projectItems = [];
+            
+            // NEW: Ensure timer preferences exist in state
+            if(!state.timerPrefs) state.timerPrefs = { pSess: 30, pBrk: 10, pRep: 3, tH: 0, tM: 5, tS: 0 };
 
             state.events.forEach(e => { if (!e.type) e.type = e.isMilestone ? 'milestone' : 'event'; if (e.zIndex === undefined) e.zIndex = 0; if (e.inTodoList && !e.todoTab) e.todoTab = 'Inbox'; });
             state.customTodos.forEach(c => { if(!c.tab) c.tab = 'Inbox'; if(!c.type) c.type = 'todo'; });
             state.habitEditMode = false; state.habitCreateMode = false; state.todoEditMode = false; state.projectEditMode = false; state.noteEditMode = false; 
             
             state.atmoMuted = true;
+            
+            // NEW: Force background to be locked on boot
+            state.atmoInteractive = false;
         }
 
         async function loadFromLocalFallback() {
@@ -8247,12 +8253,25 @@ window.addEventListener('message', (e) => {
             
             await loadFromLocalFallback();
             normalizeLoadedState();
+            
+            // NEW: Restore Timer & Pomodoro inputs from state memory
+            if (state.timerPrefs) {
+                if (document.getElementById('pomo-session')) document.getElementById('pomo-session').value = state.timerPrefs.pSess;
+                if (document.getElementById('pomo-break')) document.getElementById('pomo-break').value = state.timerPrefs.pBrk;
+                if (document.getElementById('pomo-repeat')) document.getElementById('pomo-repeat').value = state.timerPrefs.pRep;
+                if (document.getElementById('tmr-h')) document.getElementById('tmr-h').value = String(state.timerPrefs.tH).padStart(2, '0');
+                if (document.getElementById('tmr-m')) document.getElementById('tmr-m').value = String(state.timerPrefs.tM).padStart(2, '0');
+                if (document.getElementById('tmr-s')) document.getElementById('tmr-s').value = String(state.timerPrefs.tS).padStart(2, '0');
+                if (typeof renderPomoSequence === 'function') renderPomoSequence();
+            }
+
             renderAll();
             resizeCanvas();
             checkNotifications();
             applyAtmosphere();
 
-            // Auto-pull using the SHA Guardian
+            // Perform a safe smart-pull on boot to check for external updates.
+            // The conflict resolution guardian will protect unsynced local changes.
             forceLoadFromCloud(true);
         }
 
@@ -8905,7 +8924,16 @@ window.addEventListener('message', (e) => {
         window.togglePomodoro = () => {
             const btn = document.getElementById('btn-pomo-start'); const stopBtn = document.getElementById('btn-pomo-stop');
             if(timers.pomo.state === 'idle') {
-                const s = parseInt(document.getElementById('pomo-session').value)*60 || 1800; const b = parseInt(document.getElementById('pomo-break').value)*60 || 600; const r = parseInt(document.getElementById('pomo-repeat').value) || 3;
+                const sVal = parseInt(document.getElementById('pomo-session').value) || 30; 
+                const bVal = parseInt(document.getElementById('pomo-break').value) || 10; 
+                const rVal = parseInt(document.getElementById('pomo-repeat').value) || 3;
+                
+                // NEW: SAVE SETTINGS TO STATE AND CLOUD
+                if (!state.timerPrefs) state.timerPrefs = {};
+                state.timerPrefs.pSess = sVal; state.timerPrefs.pBrk = bVal; state.timerPrefs.pRep = rVal;
+                saveToStorage();
+
+                const s = sVal * 60; const b = bVal * 60; const r = rVal;
                 timers.pomo.phases = []; for(let i=0; i<r; i++) { timers.pomo.phases.push(s); if(i < r-1) timers.pomo.phases.push(b); }
                 timers.pomo.phase = 0; timers.pomo.timeLeft = timers.pomo.phases[0]; document.getElementById('pomo-setup-view').style.display = 'none'; document.getElementById('pomo-run-view').style.display = 'flex'; stopBtn.disabled = false;
             }
@@ -8920,13 +8948,22 @@ window.addEventListener('message', (e) => {
         window.toggleTimer = () => {
             const btn = document.getElementById('btn-tmr-start'); const stopBtn = document.getElementById('btn-tmr-stop');
             if(timers.tmr.state === 'idle') {
-                const h = parseInt(document.getElementById('tmr-h').value) || 0; const m = parseInt(document.getElementById('tmr-m').value) || 0; const s = parseInt(document.getElementById('tmr-s').value) || 0;
+                const h = parseInt(document.getElementById('tmr-h').value) || 0; 
+                const m = parseInt(document.getElementById('tmr-m').value) || 0; 
+                const s = parseInt(document.getElementById('tmr-s').value) || 0;
+                
+                // NEW: SAVE SETTINGS TO STATE AND CLOUD
+                if (!state.timerPrefs) state.timerPrefs = {};
+                state.timerPrefs.tH = h; state.timerPrefs.tM = m; state.timerPrefs.tS = s;
+                saveToStorage();
+
                 timers.tmr.timeLeft = (h*3600) + (m*60) + s; if(timers.tmr.timeLeft <= 0) return;
                 document.getElementById('tmr-setup-view').style.display = 'none'; document.getElementById('tmr-run-view').style.display = 'flex'; stopBtn.disabled = false;
             }
             if(timers.tmr.state === 'idle' || timers.tmr.state === 'paused') { timers.tmr.state = 'running'; btn.innerText = "PAUSE"; timers.tmr.interval = setInterval(tickTimer, 1000); } else if(timers.tmr.state === 'running') { timers.tmr.state = 'paused'; btn.innerText = "RESUME"; clearInterval(timers.tmr.interval); }
             document.getElementById('tmr-time-display').innerText = formatTimeSpanHMS(timers.tmr.timeLeft);
         };
+		
         window.stopTimer = () => { clearInterval(timers.tmr.interval); timers.tmr.state = 'idle'; document.getElementById('tmr-setup-view').style.display = 'flex'; document.getElementById('tmr-run-view').style.display = 'none'; document.getElementById('btn-tmr-start').innerText = "START"; document.getElementById('btn-tmr-stop').disabled = true; };
         function tickTimer() { timers.tmr.timeLeft--; document.getElementById('tmr-time-display').innerText = formatTimeSpanHMS(timers.tmr.timeLeft); if(timers.tmr.timeLeft <= 0) { if(typeof playBeep==='function') playBeep(); stopTimer(); } }
 
@@ -9488,7 +9525,7 @@ window.openDrawioWorkspace = (existingDiagId = null, title = "New Diagram", mode
 
         window.toggleAtmoInteractive = () => {
             state.atmoInteractive = !state.atmoInteractive;
-            saveToStorage();
+            // Removed saveToStorage() so we don't trigger a cloud sync just for unlocking the background!
             updateAtmoInteractivity();
         };
 		
@@ -10497,7 +10534,20 @@ bDays.forEach(b => {
             document.getElementById('notes-sidebar').style.display = state.showTabs.notes ? 'flex' : 'none';
             document.getElementById('notes-new-tab-btn-wrap').style.display = state.showTabs.notes ? 'block' : 'none';
         }
-        window.saveActiveNote = () => { const act = state.notes.find(n => n.id === state.activeNoteId); if(act) { act.title = document.getElementById('inp-note-title').value; act.content = document.getElementById('inp-note-content').value; saveToStorage(); } };
+        let noteSaveTimeout = null;
+        window.saveActiveNote = () => { 
+            const act = state.notes.find(n => n.id === state.activeNoteId); 
+            if(act) { 
+                act.title = document.getElementById('inp-note-title').value; 
+                act.content = document.getElementById('inp-note-content').value; 
+                
+                // Debounce: Update local memory instantly, but delay the heavy cloud push
+                clearTimeout(noteSaveTimeout);
+                noteSaveTimeout = setTimeout(() => {
+                    saveToStorage(); 
+                }, 2000); // Syncs to GitHub 1.5 seconds after you stop typing
+            } 
+        };
         window.addNewNoteTab = () => { saveActiveNote(); const id = 'n_'+Date.now(); state.notes.push({id, title: 'New Tab', content: ''}); state.activeNoteId = id; saveToStorage(); renderNotes(); };
         window.deleteNoteTab = (id) => { if(confirm("Delete note?")) { state.notes = state.notes.filter(n=>n.id!==id); if(state.notes.length===0) state.notes.push({id: 'n_'+Date.now(), title:'Main Note', content:''}); state.activeNoteId = state.notes[0].id; saveToStorage(); renderNotes(); }};
 

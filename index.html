@@ -181,7 +181,7 @@
         
         .frameless-title { display: none; font-size: 11px; font-weight: 700; color: var(--accent-color); text-transform: uppercase; margin-bottom: 8px; letter-spacing: 0.5px; }
         .tool-window.frameless .frameless-title { display: block !important; }
-        .tool-window.maximized { top: 50px !important; left: 0 !important; right: auto !important; bottom: auto !important; width: 100vw !important; height: calc(100vh - 50px) !important; border-radius: 0 !important; box-shadow: none !important; z-index: 400 !important; transition: none !important; }
+        .tool-window.maximized { top: 0 !important; left: 0 !important; right: auto !important; bottom: auto !important; width: 100vw !important; height: 100vh !important; border-radius: 0 !important; box-shadow: none !important; z-index: 400 !important; transition: none !important; }
         .tool-window.maximized .drag-header { border-radius: 0 !important; cursor: default !important; }
 
         /* Specific elements to hide when frameless */
@@ -303,7 +303,6 @@
         #paint-app-root.lite-ui .lite-only { display: block !important; min-height: 34px; padding: 4px !important; }
         #paint-app-root.lite-ui .divider { display: none !important; }
         @media (max-width: 768px) and (orientation: portrait) {
-            #paint-app-root.lite-ui .toolbar { flex-direction: row !important; }
             #paint-app-root { flex-direction: column; }
             #paint-app-root .toolbar { width: 100%; flex-direction: column; height: auto; overflow-x: auto; border-right: none; border-bottom: 1px solid var(--modal-border, #1a1a1a); padding: 8px 5px; gap: 6px; }
             #paint-app-root .toolbar-col { display: flex; flex-direction: row; gap: 5px; min-width: max-content; }
